@@ -1,4 +1,4 @@
-### My project of writing cuda kernels
+# My project of writing cuda kernels
 Used only for study and communication purpose
 
 To compile kernels, use the following command

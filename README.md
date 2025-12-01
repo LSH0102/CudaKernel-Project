@@ -8,3 +8,6 @@ To compile kernels, use the following command
 then 
 
 `python test.py`
+
+##Functions
+1. Vector addition (added on 2025/12/1)

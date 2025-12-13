@@ -16,7 +16,7 @@ then
 
 ### Conv2d:implementation
 A conv2d operation with high performance can be regarded as a series of matrix multiplication. 
-$$Out[b,i,j,t]=\sum_{m=0}^{\text{filter\_H}-1}\sum_{n=0}^{\text{filter\_W}-1}\sum_{c=0}^{\text{in\_channel}-1}x[b,i+m,j+n,c]\cdot w[m,n,c,t]$$
+$$Out[b,i,j,t]=\sum_{m=0}^{filter\textunderscore H-1}\sum_{n=0}^{filter\textunderscore W-1}\sum_{c=0}^{in\textunderscore channel-1}x[b,i+m,j+n,c]\cdot w[m,n,c,t]$$
 
 Here is a numpy implementation of conv2d:
 ```python

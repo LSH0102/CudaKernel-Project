@@ -22,7 +22,6 @@ A conv2d operation with high performance can be regarded as a series of matrix m
     width=x.shape[2]
     height=x.shape[1]
     out_channel=w.shape[-1]
-    
     o_height=(2*padding+height-w.shape[0])//stride+1
     o_width=(2*padding+width-w.shape[1])//stride+1
     out=np.zeros((batch_size,o_height,o_width,out_channel))

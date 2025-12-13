@@ -11,3 +11,4 @@ then
 
 ## Functions
 1. Vector addition (added on 2025/12/1)
+2. batched matrix multiplication (added on 2025/12/2)

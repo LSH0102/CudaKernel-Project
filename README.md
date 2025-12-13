@@ -16,7 +16,8 @@ then
 
 ### Conv2d:implementation
 A conv2d operation with high performance can be regarded as a series of matrix multiplication. Here is a numpy implementation of conv2d:
-`conv_np(x,w,stride,padding):
+`
+conv_np(x,w,stride,padding):
 
     batch_size=x.shape[0]
     in_channel=x.shape[-1]

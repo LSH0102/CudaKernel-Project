@@ -16,9 +16,7 @@ then
 
 ### Conv2d:implementation
 A conv2d operation with high performance can be regarded as a series of matrix multiplication. Here is a numpy implementation of conv2d:
-
-`
-def conv_np(x,w,stride,padding):
+`def conv_np(x,w,stride,padding):
     batch_size=x.shape[0]
     in_channel=x.shape[-1]
     width=x.shape[2]
@@ -36,4 +34,6 @@ def conv_np(x,w,stride,padding):
             shift=shift.reshape((batch_size,o_width*o_height,in_channel))
             filt=w[i,j].reshape((1,in_channel,out_channel))
             out+=np.matmul(shift,filt).reshape((batch_size,o_height,o_width,out_channel))
-    return out `
+    return out 
+`
+

@@ -15,7 +15,10 @@ then
 3. conv2d (added on 2025/12/13)
 
 ### Conv2d:implementation
-A conv2d operation with high performance can be regarded as a series of matrix multiplication. Here is a numpy implementation of conv2d:
+A conv2d operation with high performance can be regarded as a series of matrix multiplication. 
+$$Out[b,i,j,t]=\sum_{m=0}^{filter_H-1}\sum_{n=0}^{filter_W-1}\sum_{c=0}^{in_channel}x[b,i+m,j+n,c]\cdot w[m,n,c,t]$$
+
+Here is a numpy implementation of conv2d:
 ```python
 def conv_np(x,w,stride,padding):
 

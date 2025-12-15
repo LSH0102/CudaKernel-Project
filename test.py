@@ -130,6 +130,33 @@ def shift(a:np.ndarray,i,j,o_height,o_width,stride):
     res=res.reshape((b,o_height,o_width,c))
     return res
 
+def flash_attention_forward(q,k,v):
+    b,q_len,d=q.shape
+    kv_len=k.shape[1]
+    
+    res=torch.zeros(size=(b,q_len,d)).view(-1).numpy()
+    
+    stream=torch.cuda.current_stream().cuda_stream
+    
+    lib.launch_flash_attention_forward.argtypes=[
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_void_p]
+    
+    lib.launch_flash_attention_forward.restype=None
+    
+    lib.launch_flash_attention_forward(q.flatten(),k.flatten(),v.flatten(),res,b,q_len,kv_len,d,np.sqrt(d),stream)
+    
+    res=res.reshape((b,q_len,d))
+    return res
+
 def test_vector_add():
     shape=(2,3,4) 
     
@@ -258,9 +285,32 @@ def test_conv2d():
     print('maximal error:',np.abs(out-ref).max())
     print('acceleration:',acc)
     assert np.abs(out-ref).max()<1e-3
+    
+def test_flash_attention_forward():
+    #torch.manual_seed(10)
+    q=torch.randn(size=(32,4096,128)).numpy()
+    k=torch.randn(size=(32,4096,128)).numpy()
+    v=torch.randn(size=(32,4096,128)).numpy()
+    
+    t1=time.time()
+    out=flash_attention_forward(q, k, v)
+    t2=time.time()
+    
+    kT=k.transpose((0,2,1))
+    
+    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])
+    
+    s=np.exp(s)/np.sum(np.exp(s),axis=-1,keepdims=True)
+    
+    ref=np.matmul(s,v)
+    t3=time.time()
+    
+    acc=(t3-t2)/(t2-t1)
+    print('maximal error:',np.abs(ref-out).max())
+    print('acceleration:',acc)
 
 
 if __name__=="__main__":
-    test_conv2d()
-    
+    #test_conv2d()
+    test_flash_attention_forward()
     

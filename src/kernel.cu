@@ -1,8 +1,12 @@
 #include <cuda.h>
 #include <cstddef>
 #include <stdio.h>
+#include <math.h>
+#include <cuda_runtime.h>
 
 const int TILE_SIZE=64;
+const int Bq=4;
+const int Bkv=4;
 ///用于测试用的向量加法内核
 __global__ void vector_add_kernel(float* a, float* b,float*c,const int size)
 {
@@ -97,6 +101,179 @@ __global__ void conv_bmm(float *shift, float* filter, float *c,int batch_size,co
 		}
 	}
 }
+
+///flash attention forward的内核
+__global__ void flash_attention_forward(float *dQ, float *dK, float *dV, float *dO, int batch_size, int q_len, int kv_len, int d, float scale, int Tq, int Tkv)
+{
+	//block的总数是batch_size*Tq, batch_id*Tq+i处理第batch_id个batch的第i个tile
+	
+	int batch_id=blockIdx.x/Tq;
+	int i=blockIdx.x-batch_id*Tq;
+
+	//这个block需要处理一个瓦片 Sij=(Bq,Bkv) for 1\leq j\leq Tkv
+	int j=0;
+	int k=0;
+
+	//声明block内部的共享数据
+	__shared__ float Qi[Bq][128];
+	__shared__ float Oij[Bq][128];
+	__shared__ float li[Bq];
+	__shared__ float mi[Bq];
+	__shared__ float Kj[Bkv][128];
+	__shared__ float Vj[Bkv][128];
+	__shared__ float Sij[Bq][Bkv];
+	__shared__ float new_mi[Bq];
+
+	__shared__ float row_reduction[Bq][128];
+
+	
+	float temp=0.0;
+	int step=1;
+	int t=0;
+	//先读取Qi并初始化li和mi
+	if(threadIdx.x<Bq && threadIdx.y==0 && Bq*i+threadIdx.x<q_len)
+	{
+		for(j=0;j<d;j++)
+		{
+			Qi[threadIdx.x][j]=dQ[batch_id*q_len*d+(Bq*i+threadIdx.x)*d+j];
+			
+		}
+		li[threadIdx.x]=0.0;
+		mi[threadIdx.x]=-INFINITY;
+	}
+	__syncthreads();
+	for(j=0;j<Tkv;j++)
+	{
+		//读取Kj和Vj
+		if(threadIdx.x==0&&threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len)
+		{
+			for(k=0;k<d;k++)
+			{
+				Kj[threadIdx.y][k]=dK[batch_id*kv_len*d+(Bkv*j+threadIdx.y)*d+k];
+				Vj[threadIdx.y][k]=dV[batch_id*kv_len*d+(Bkv*j+threadIdx.y)*d+k];
+				
+			}
+		}
+		__syncthreads();
+		//准备矩阵乘法并除以缩放因子scale
+		temp=0.0;
+		if(threadIdx.x<Bq && threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len&& Bq*i+threadIdx.x<q_len)
+		{
+			for(k=0;k<d;k++)
+			{
+				temp+=Qi[threadIdx.x][k]*Kj[threadIdx.y][k];
+			
+			}
+			Sij[threadIdx.x][threadIdx.y]=temp/scale;
+			row_reduction[threadIdx.x][threadIdx.y]=Sij[threadIdx.x][threadIdx.y];
+		}
+		
+		//求Sij的逐行最大值并放入row_reduction
+		if(threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+		{
+			for(step=2;step<4*d;step=2*step)
+			{
+				if(threadIdx.y%step==0&&threadIdx.y+step/2<Bkv && threadIdx.y+step/2<kv_len)
+				{
+					if(row_reduction[threadIdx.x][threadIdx.y]>=row_reduction[threadIdx.x][threadIdx.y+step/2])
+					{
+						row_reduction[threadIdx.x][threadIdx.y]=row_reduction[threadIdx.x][threadIdx.y];
+					}
+					else
+					{
+						row_reduction[threadIdx.x][threadIdx.y]=row_reduction[threadIdx.x][threadIdx.y+step/2];
+					}
+				}
+			}	
+		}
+		__syncthreads();
+
+		
+		//求mi^{j}=max ( mi^{j-1},rowmaxSij)
+		if(threadIdx.y==0 && threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+		{
+			if(mi[threadIdx.x]<row_reduction[threadIdx.x][0])
+			{
+				new_mi[threadIdx.x]=row_reduction[threadIdx.x][0];
+			}
+			else
+			{
+				new_mi[threadIdx.x]=mi[threadIdx.x];
+			}
+		}
+		__syncthreads();
+
+		//此时的Sij是Pij. 将row_reduction初始化, 准备进行逐行求和
+		if(threadIdx.x<Bq && threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len&& Bq*i+threadIdx.x<q_len)
+		{
+			Sij[threadIdx.x][threadIdx.y]=__expf( Sij[threadIdx.x][threadIdx.y]-new_mi[threadIdx.x] );
+			row_reduction[threadIdx.x][threadIdx.y]=Sij[threadIdx.x][threadIdx.y];
+		}
+		__syncthreads();
+
+		//计算Pij的逐行和
+		if(threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+		{
+			for(step=2;step<4*d;step=2*step)
+			{
+				if(threadIdx.y%step==0&&threadIdx.y+step/2<Bkv && threadIdx.y+step/2<kv_len)
+				{
+					row_reduction[threadIdx.x][threadIdx.y]+=row_reduction[threadIdx.x][threadIdx.y+step/2];
+				}
+			}	
+		}
+		__syncthreads();
+
+		if(threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+		{
+			if(threadIdx.y==0)
+			{
+				li[threadIdx.x]=__expf(mi[threadIdx.x]-new_mi[threadIdx.x] )*li[threadIdx.x]+row_reduction[threadIdx.x][0];
+				for(t=0;t<d;t++)
+				{
+					Oij[threadIdx.x][t]=Oij[threadIdx.x][t]*__expf(mi[threadIdx.x]-new_mi[threadIdx.x]);
+				}
+			}
+		}
+		__syncthreads();
+
+		//加上Pij乘以 Vj
+		if(threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+		{
+			if(threadIdx.y==0)
+			{
+				for(t=0;t<d;t++)
+				{
+					for(k=0;k<Bkv;k++)
+					{
+						Oij[threadIdx.x][t]+=Sij[threadIdx.x][k]*Vj[k][t];	
+					}
+				}
+				//更新mi, 因为mi没法做到原地更新
+				mi[threadIdx.x]=new_mi[threadIdx.x];
+			
+			}
+		}
+		__syncthreads();
+		//开启下一轮循环
+	}
+
+	//准备将对应的Oij写入输出
+	if(threadIdx.x<Bq && Bq*i+threadIdx.x<q_len)
+	{
+		if(threadIdx.y==0)
+		{
+			for(k=0;k<d;k++)
+			{
+			
+				dO[batch_id*q_len*d+(Bq*i+threadIdx.x)*d+k]=Oij[threadIdx.x][k]/li[threadIdx.x];
+			
+			}
+		}
+	}
+}
+
+
 
 ///调用内核的主程序
 extern "C"
@@ -239,6 +416,43 @@ extern "C"
 		cudaFree(d_out);
 		cudaFree(temp);
 		cudaFree(shift);
+	}
+	
+	void launch_flash_attention_forward(float *Q, float *K, float *V, float *O, int batch_size, int q_len, int kv_len, int d, float scale, cudaStream_t stream)
+	{
+		int Q_size=sizeof(float)*batch_size*q_len*d;
+		int KV_size=sizeof(float)*batch_size*kv_len*d;
+		int O_size=sizeof(float)*batch_size*q_len*d;
+
+		float *d_Q, *d_K, *d_V, *d_O;
+		cudaMalloc((void**)&d_Q,Q_size);
+		cudaMalloc((void**)&d_K,KV_size);
+		cudaMalloc((void**)&d_V,KV_size);
+		cudaMalloc((void**)&d_O,O_size);
+
+		cudaMemcpy(d_Q,Q,Q_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_K,K,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_V,V,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_O,O,O_size,cudaMemcpyHostToDevice);
+
+
+		//把Q切成(batch,Bq,d), KV切成(batch,Bkv,d)
+
+		int Tq=(q_len+Bq-1)/Bq;
+		int Tkv=(kv_len+Bkv-1)/Bkv;
+
+		
+		dim3 grid_dim(batch_size*Tq,1,1);
+		dim3 block_dim(Bq,Bkv,1);
+		flash_attention_forward<<<grid_dim,block_dim,0,stream>>>(d_Q,d_K,d_V,d_O,batch_size,q_len,kv_len,d,scale,Tq,Tkv);
+
+
+		cudaMemcpy(O,d_O,O_size,cudaMemcpyDeviceToHost);
+
+		cudaFree(d_Q);
+		cudaFree(d_K);
+		cudaFree(d_V);
+		cudaFree(d_O);
 
 
 	}

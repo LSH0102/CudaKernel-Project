@@ -103,7 +103,7 @@ __global__ void conv_bmm(float *shift, float* filter, float *c,int batch_size,co
 }
 
 ///flash attention forward的内核
-__global__ void flash_attention_forward(float *dQ, float *dK, float *dV, float *dO, int batch_size, int q_len, int kv_len, int d, float scale, int Tq, int Tkv)
+__global__ void flash_attention_forward(float *dQ, float *dK, float *dV,float *dm, float *dO,  int batch_size, int q_len, int kv_len, int d, float scale, int Tq, int Tkv)
 {
 	//block的总数是batch_size*Tq, batch_id*Tq+i处理第batch_id个batch的第i个tile
 	
@@ -164,8 +164,9 @@ __global__ void flash_attention_forward(float *dQ, float *dK, float *dV, float *
 				temp+=Qi[threadIdx.x][k]*Kj[threadIdx.y][k];
 			
 			}
-			Sij[threadIdx.x][threadIdx.y]=temp/scale;
+			Sij[threadIdx.x][threadIdx.y]=temp/scale+dm[(Bq*i+threadIdx.x)*kv_len+Bkv*j+threadIdx.y];
 			row_reduction[threadIdx.x][threadIdx.y]=Sij[threadIdx.x][threadIdx.y];
+			
 		}
 		
 		//求Sij的逐行最大值并放入row_reduction
@@ -272,8 +273,172 @@ __global__ void flash_attention_forward(float *dQ, float *dK, float *dV, float *
 		}
 	}
 }
+///flash attention backward的rowsum(dO*O)
+__global__ void rowsum(float *dO, float *O, float *D,int batch_size, int q_len, int d,int Tq)
+{
+	//block的总数是batch_size*Tq, batch_id*Tq+i处理第batch_id个batch的第i个tile
+	
+	int batch_id=blockIdx.x/Tq;
+	int i=blockIdx.x-batch_id*Tq;
 
+	//这个block需要处理一个瓦片 Qij=(Bq,d)
+	int j=0;
+	
+	//先读取Qi并初始化li和mi
+	if(threadIdx.x<Bq && threadIdx.y==0 && Bq*i+threadIdx.x<q_len)
+	{
+		D[batch_id*q_len+(Bq*i+threadIdx.x)]=0.0;
+		for(j=0;j<d;j++)
+		{
+			D[batch_id*q_len+(Bq*i+threadIdx.x)]+=dO[batch_id*q_len*d+(Bq*i+threadIdx.x)*d+j]*O[batch_id*q_len*d+(Bq*i+threadIdx.x)*d+j];
+			
+		}
+	}
+}
 
+///flash attention bachward 的主内核函数
+__global__ void flash_attention_backward(float *Q, float* O,float *dO, float* K, float *V, float *dQ, float *dK, 
+										float *dV,float *L,float *D, float *m, int batch_size, int q_len,int kv_len, int d, float scale,int Tq, int Tkv)
+{
+	//block的总数是batch_size*Tkv, batch_id*Tkv+j处理第batch_id个batch的第j个tile
+	
+	int batch_id=blockIdx.x/Tkv;
+	int j=blockIdx.x-batch_id*Tkv;
+	int i,k,t;
+	float temp;
+	//这个block需要处理一个瓦片 Sij=(Bq,Bkv) for 1\leq i \leq Tq
+
+	//声明block内部的共享数据
+	__shared__ float Qi[Bq][128];
+	__shared__ float dOi[Bq][128];
+
+	__shared__ float li[Bq];
+	__shared__ float Di[Bq];
+	__shared__ float Kj[Bkv][128];
+	__shared__ float Vj[Bkv][128];
+	__shared__ float dKj[Bkv][128];
+	__shared__ float dVj[Bkv][128];
+	__shared__ float Sij[Bq][Bkv];
+	__shared__ float dPij[Bq][Bkv];
+
+	//读取Kj和Vj并初始化dKj和dVj
+	if(threadIdx.x<Bkv && threadIdx.y==0 && Bkv*j+threadIdx.x<kv_len)
+	{
+		for(i=0;i<d;i++)
+		{
+			Kj[threadIdx.x][i]=K[batch_id*kv_len*d+(Bkv*j+threadIdx.x)*d+i];
+			Vj[threadIdx.x][i]=V[batch_id*kv_len*d+(Bkv*j+threadIdx.x)*d+i];
+			dKj[threadIdx.x][i]=0.0;
+			dVj[threadIdx.x][i]=0.0;
+		}
+	}
+	__syncthreads();
+
+	for(i=0;i<Tq;i++)
+	{
+		//加载Qi,Oi,dQi,dOi,Li,Di;
+		if(threadIdx.x==0&&threadIdx.y<Bq && Bq*i+threadIdx.y<q_len)
+		{
+			for(k=0;k<d;k++)
+			{
+				Qi[threadIdx.y][k]=Q[batch_id*q_len*d+(Bq*i+threadIdx.y)*d+k];
+				dOi[threadIdx.y][k]=dO[batch_id*q_len*d+(Bq*i+threadIdx.y)*d+k];
+			}
+			li[threadIdx.y]=L[batch_id*q_len+(Bq*i+threadIdx.y)];
+			Di[threadIdx.y]=D[batch_id*q_len+(Bq*i+threadIdx.y)];
+		}
+		__syncthreads();
+		//计算矩阵乘法然后直接转化为注意力概率
+		temp=0.0;
+		if(threadIdx.x<Bq && threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len&& Bq*i+threadIdx.x<q_len)
+		{
+			for(k=0;k<d;k++)
+			{
+				temp+=Qi[threadIdx.x][k]*Kj[threadIdx.y][k];
+			
+			}
+			Sij[threadIdx.x][threadIdx.y]=__expf(  temp/scale+m[(Bq*i+threadIdx.x)*kv_len+Bkv*j+threadIdx.y]-li[threadIdx.x]);
+		}
+		__syncthreads();
+
+		//更新dV, 这是矩阵乘法
+		if(threadIdx.x<Bkv&& Bkv*j+threadIdx.x<kv_len && threadIdx.y==0)
+		{
+			for(k=0;k<d;k++)
+			{
+				for(t=0;t<Bq && Bq*i+t<q_len;t++)
+				{
+					dVj[threadIdx.x][k]+=Sij[t][threadIdx.x]*dOi[t][k];
+				}
+			}
+		}
+		__syncthreads();
+
+		//计算dPij
+		temp=0.0;
+		if(threadIdx.x<Bq && threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len&& Bq*i+threadIdx.x<q_len)
+		{
+			for(k=0;k<d;k++)
+			{
+				temp+=dOi[threadIdx.x][k]*Vj[threadIdx.y][k];
+			
+			}
+			dPij[threadIdx.x][threadIdx.y]=temp;
+		}
+		__syncthreads();
+		//计算dSij
+		if(threadIdx.x<Bq && threadIdx.y<Bkv && Bkv*j+threadIdx.y<kv_len&& Bq*i+threadIdx.x<q_len)
+		{
+			
+			Sij[threadIdx.x][threadIdx.y]=Sij[threadIdx.x][threadIdx.y]*(dPij[threadIdx.x][threadIdx.y]-Di[threadIdx.x])/scale;
+		}
+		__syncthreads();
+
+		//原子更新dQ 
+		if(threadIdx.x<Bq&& Bq*i+threadIdx.x<q_len && threadIdx.y==0)
+		{
+			for(k=0;k<d;k++)
+			{
+				temp=0.0;
+				for(t=0;t<Bkv && Bkv*j+t<kv_len;t++)
+				{
+					temp+=Sij[threadIdx.x][t]*Kj[t][k];
+				}
+				atomicAdd(&dQ[batch_id*q_len*d+(Bq*i+threadIdx.x)*d+k],temp);
+			}
+		}
+		__syncthreads();
+
+		//更新dKj
+		if(threadIdx.x<Bkv&& Bkv*j+threadIdx.x<kv_len && threadIdx.y==0)
+		{
+			for(k=0;k<d;k++)
+			{
+				for(t=0;t<Bq && Bq*i+t<q_len;t++)
+				{
+					dKj[threadIdx.x][k]+=Sij[t][threadIdx.x]*Qi[t][k];
+				}
+			}
+		}
+		__syncthreads();
+		//开始下一轮循环
+
+	}
+	//将dK和dQ写回存储
+	if(threadIdx.x<Bkv && Bkv*j+threadIdx.x<kv_len)
+	{
+		if(threadIdx.y==0)
+		{
+			for(k=0;k<d;k++)
+			{
+			
+				dK[batch_id*kv_len*d+(Bkv*j+threadIdx.x)*d+k]=dKj[threadIdx.x][k];
+				dV[batch_id*kv_len*d+(Bkv*j+threadIdx.x)*d+k]=dVj[threadIdx.x][k];
+			
+			}
+		}
+	}
+}
 
 ///调用内核的主程序
 extern "C"
@@ -418,23 +583,25 @@ extern "C"
 		cudaFree(shift);
 	}
 	
-	void launch_flash_attention_forward(float *Q, float *K, float *V, float *O, int batch_size, int q_len, int kv_len, int d, float scale, cudaStream_t stream)
+	void launch_flash_attention_forward(float *Q, float *K, float *V,float *m, float *O,  int batch_size, int q_len, int kv_len, int d, float scale, cudaStream_t stream)
 	{
 		int Q_size=sizeof(float)*batch_size*q_len*d;
 		int KV_size=sizeof(float)*batch_size*kv_len*d;
 		int O_size=sizeof(float)*batch_size*q_len*d;
+		int m_size=sizeof(float)*q_len*kv_len;
 
-		float *d_Q, *d_K, *d_V, *d_O;
+		float *d_Q, *d_K, *d_V, *d_O,*d_m;
 		cudaMalloc((void**)&d_Q,Q_size);
 		cudaMalloc((void**)&d_K,KV_size);
 		cudaMalloc((void**)&d_V,KV_size);
 		cudaMalloc((void**)&d_O,O_size);
+		cudaMalloc((void**)&d_m,m_size);
 
 		cudaMemcpy(d_Q,Q,Q_size,cudaMemcpyHostToDevice);
 		cudaMemcpy(d_K,K,KV_size,cudaMemcpyHostToDevice);
 		cudaMemcpy(d_V,V,KV_size,cudaMemcpyHostToDevice);
 		cudaMemcpy(d_O,O,O_size,cudaMemcpyHostToDevice);
-
+		cudaMemcpy(d_m,m,m_size,cudaMemcpyHostToDevice);
 
 		//把Q切成(batch,Bq,d), KV切成(batch,Bkv,d)
 
@@ -444,7 +611,7 @@ extern "C"
 		
 		dim3 grid_dim(batch_size*Tq,1,1);
 		dim3 block_dim(Bq,Bkv,1);
-		flash_attention_forward<<<grid_dim,block_dim,0,stream>>>(d_Q,d_K,d_V,d_O,batch_size,q_len,kv_len,d,scale,Tq,Tkv);
+		flash_attention_forward<<<grid_dim,block_dim,0,stream>>>(d_Q,d_K,d_V,d_m,d_O, batch_size,q_len,kv_len,d,scale,Tq,Tkv);
 
 
 		cudaMemcpy(O,d_O,O_size,cudaMemcpyDeviceToHost);
@@ -453,6 +620,72 @@ extern "C"
 		cudaFree(d_K);
 		cudaFree(d_V);
 		cudaFree(d_O);
+		cudaFree(d_m);
+	}
+
+	void launch_flash_attention_backward(float *Q, float *K, float *V, float *O,float *dO, float *L,
+										float *pQ, float *pK, float *pV,float *m,
+	
+										int batch_size, int q_len, int kv_len, int d, float scale, cudaStream_t stream)
+	{
+		int Q_size=sizeof(float)*batch_size*q_len*d;
+		int KV_size=sizeof(float)*batch_size*kv_len*d;
+		int O_size=sizeof(float)*batch_size*q_len*d;
+		int L_size=sizeof(float)*batch_size*q_len;
+		int m_size=sizeof(float)*q_len*kv_len;
+
+		float *d_Q, *d_K, *d_V, *d_O, *ddO, *d_L, *d_D, *d_pQ, *d_pK, *d_pV, *d_m;
+		cudaMalloc((void**)&d_Q,Q_size);
+		cudaMalloc((void**)&d_K,KV_size);
+		cudaMalloc((void**)&d_V,KV_size);
+		cudaMalloc((void**)&d_O,O_size);
+		cudaMalloc((void**)&ddO,O_size);
+		cudaMalloc((void**)&d_L,L_size);
+		cudaMalloc((void**)&d_D,L_size);
+		cudaMalloc((void**)&d_pQ,Q_size);
+		cudaMalloc((void**)&d_pK,KV_size);
+		cudaMalloc((void**)&d_pV,KV_size);
+		cudaMalloc((void**)&d_m,m_size);
+
+		cudaMemcpy(d_Q,Q,Q_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_K,K,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_V,V,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_O,O,O_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(ddO,dO,O_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_L,L,L_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_pQ,pQ,Q_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_pK,pK,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_pV,pV,KV_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_m,m,m_size,cudaMemcpyHostToDevice);
+
+		int Tq=(q_len+Bq-1)/Bq;
+		int Tkv=(kv_len+Bkv-1)/Bkv;
+
+		
+		dim3 grid_dim(batch_size*Tq,1,1);
+		dim3 grid_dim2(batch_size*Tkv,1,1);
+		dim3 block_dim(Bq,Bkv,1);
+
+		rowsum<<<grid_dim,block_dim,0,stream>>>(ddO, d_O, d_D,batch_size,q_len,d,Tq);
+		
+		flash_attention_backward<<<grid_dim2,block_dim,0,stream>>>(d_Q,d_O,ddO,d_K,d_V,d_pQ,d_pK,d_pV,d_L,d_D,d_m,batch_size,q_len,kv_len,d,scale,Tq,Tkv);
+
+		cudaMemcpy(pK,d_pK,KV_size,cudaMemcpyDeviceToHost);
+		cudaMemcpy(pV,d_pV,KV_size,cudaMemcpyDeviceToHost);
+		cudaMemcpy(pQ,d_pQ,Q_size,cudaMemcpyDeviceToHost);
+
+		cudaFree(d_Q);
+		cudaFree(d_K);
+		cudaFree(d_V);
+		cudaFree(d_O);
+		cudaFree(ddO);
+		cudaFree(d_L);
+		cudaFree(d_D);
+		cudaFree(d_pQ);
+		cudaFree(d_pK);
+		cudaFree(d_pV);
+		cudaFree(d_m);
+
 
 
 	}

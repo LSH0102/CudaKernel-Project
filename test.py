@@ -130,7 +130,7 @@ def shift(a:np.ndarray,i,j,o_height,o_width,stride):
     res=res.reshape((b,o_height,o_width,c))
     return res
 
-def flash_attention_forward(q,k,v):
+def flash_attention_forward(q,k,v,mask):
     b,q_len,d=q.shape
     kv_len=k.shape[1]
     
@@ -138,7 +138,11 @@ def flash_attention_forward(q,k,v):
     
     stream=torch.cuda.current_stream().cuda_stream
     
+    
+        
+
     lib.launch_flash_attention_forward.argtypes=[
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
         np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
         np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
         np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
@@ -152,10 +156,52 @@ def flash_attention_forward(q,k,v):
     
     lib.launch_flash_attention_forward.restype=None
     
-    lib.launch_flash_attention_forward(q.flatten(),k.flatten(),v.flatten(),res,b,q_len,kv_len,d,np.sqrt(d),stream)
+    lib.launch_flash_attention_forward(q.flatten(),k.flatten(),v.flatten(),mask.view(-1).numpy(),res,b,q_len,kv_len,d,np.sqrt(d),stream)
     
     res=res.reshape((b,q_len,d))
     return res
+
+def flash_attention_backward(q,k,v,do,mask):
+    b,q_len,d=q.shape
+    kv_len=k.shape[1]
+    kT=k.transpose((0,2,1))
+    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])+mask.numpy()
+    l=np.log(np.sum(np.exp(s),axis=-1,keepdims=True))
+    s=np.exp(s)/np.sum(np.exp(s),axis=-1,keepdims=True)
+    o=np.matmul(s,v)
+
+    dk=torch.zeros(size=(b,kv_len,d)).view(-1).numpy()
+    dv=torch.zeros(size=(b,kv_len,d)).view(-1).numpy()
+    dq=torch.zeros(size=(b,q_len,d)).view(-1).numpy()
+    
+    stream=torch.cuda.current_stream().cuda_stream
+
+    lib.launch_flash_attention_backward.argtypes=[
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_float,
+        ctypes.c_void_p]
+
+    lib.launch_flash_attention_backward.restype=None
+
+    lib.launch_flash_attention_backward(q.flatten(),k.flatten(),v.flatten(),o.flatten(),do.flatten(),l.flatten(),dq,dk,dv,mask.view(-1).numpy() ,b,q_len,kv_len,d,np.sqrt(d),stream)
+
+    dq=dq.reshape((b,q_len,d))
+    dk=dk.reshape((b,kv_len,d))
+    dv=dv.reshape((b,kv_len,d))
+    return dq,dk,dv
 
 def test_vector_add():
     shape=(2,3,4) 
@@ -286,20 +332,27 @@ def test_conv2d():
     print('acceleration:',acc)
     assert np.abs(out-ref).max()<1e-3
     
+
+
 def test_flash_attention_forward():
     #torch.manual_seed(10)
-    q=torch.randn(size=(32,4096,128)).numpy()
-    k=torch.randn(size=(32,4096,128)).numpy()
-    v=torch.randn(size=(32,4096,128)).numpy()
+    q_len=1024
+    kv_len=512
+    b=32
+    q=torch.randn(size=(b,q_len,128)).numpy()
+    k=torch.randn(size=(b,kv_len,128)).numpy()
+    v=torch.randn(size=(b,kv_len,128)).numpy()
+
+    
+    
     
     t1=time.time()
-    out=flash_attention_forward(q, k, v)
+    out=flash_attention_forward(q, k, v,mask)
     t2=time.time()
     
     kT=k.transpose((0,2,1))
     
-    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])
-    
+    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])+mask.numpy()
     s=np.exp(s)/np.sum(np.exp(s),axis=-1,keepdims=True)
     
     ref=np.matmul(s,v)
@@ -309,8 +362,51 @@ def test_flash_attention_forward():
     print('maximal error:',np.abs(ref-out).max())
     print('acceleration:',acc)
 
+def test_flash_attention_backward():
+    torch.manual_seed(10)
+    q_len=4096
+    kv_len=4096
+    d=128
+    b=32
+    q=torch.randn(size=(b,q_len,d)).numpy()
+    k=torch.randn(size=(b,kv_len,d)).numpy()
+    v=torch.randn(size=(b,kv_len,d)).numpy()
+    do=torch.randn(size=(b,q_len,d)).numpy()
+
+    i=torch.arange(q_len).unsqueeze(1)
+    j=torch.arange(kv_len).unsqueeze(0)
+
+    mask=j<=i
+    mask=mask.float().masked_fill(~mask,-float("inf"))-1.0
+
+    t1=time.time()
+    dq,dk,dv=flash_attention_backward(q,k,v,do,mask)
+    t2=time.time()
+
+    kT=k.transpose((0,2,1))
+    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])+mask.numpy()
+    
+    l=np.log(np.sum(np.exp(s),axis=-1,keepdims=True))
+    s=np.exp(s)/np.sum(np.exp(s),axis=-1,keepdims=True)
+    o=np.matmul(s,v)
+
+    s=np.matmul(q,kT)/np.sqrt(q.shape[-1])+mask.numpy()
+    p=np.exp(s-l)
+    dv_ref=np.matmul(p.transpose((0,2,1)),do)
+    dp=np.matmul(do,v.transpose((0,2,1)))
+    D=np.sum(do*o,axis=-1,keepdims=True)
+
+    ds=p*(dp-D)
+    dk_ref=np.matmul(ds.transpose((0,2,1)),q)/np.sqrt(q.shape[-1])
+    dq_ref=np.matmul(ds,k)/np.sqrt(q.shape[-1])
+    t3=time.time()
+    print(np.abs(dq-dq_ref).max())
+    print(np.abs(dk-dk_ref).max())
+    print(np.abs(dv-dv_ref).max())
+    acc=(t3-t2)/(t2-t1)
+    print('acceleration:',acc)
 
 if __name__=="__main__":
     #test_conv2d()
-    test_flash_attention_forward()
-    
+    #test_flash_attention_forward()
+    test_flash_attention_backward()

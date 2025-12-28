@@ -54,4 +54,5 @@ Thus we have
 $$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{u,v,w,y}dO[u,v,w,y]\frac{\partial O[u,v,w,y]}{\partial x[b,i,j,t]}$$
 
 So the above term $\neq 0$ if and only if $u=b,c=t,i=v * stride+m, j=w* stride+n$, i.e 
+
 $$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{m,n}\sum_{y}dO[b,\frac{i-m}{stride},\frac{j-n}{stride},y] * w[m,n,c,y]$$

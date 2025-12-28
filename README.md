@@ -50,4 +50,8 @@ def conv_np(x,w,stride,padding):
 
 $$Out[b,i,j,t]=\sum_{m=0}^{filter\textunderscore H-1}\sum_{n=0}^{filter\textunderscore W-1}\sum_{c=0}^{in\textunderscore channel-1}x[b,i* stride+m,j* stride+n,c]\cdot w[m,n,c,t]$$
 
-Thus we have $$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{u,v,w,y}\frac{\partial L}{\partial O[u,v,w,y]}\frac{\partial O[u,v,w,y]}{\partial x[b,i,j,t]}$$
+Thus we have 
+$$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{u,v,w,y}dO[u,v,w,y]\frac{\partial O[u,v,w,y]}{\partial x[b,i,j,t]}$$
+
+So the above term $\neq 0$ if and only if $u=b,c=t,i=v * stride+m, j=w* stride+n$, i.e 
+$$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{m,n}\sum_{y{dO[b,\frac{i-m}{stride},\frac{j-n}{stride},y] * w[m,n,c,y]$$

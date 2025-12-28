@@ -46,3 +46,8 @@ def conv_np(x,w,stride,padding):
     return out 
 ```
 
+### Conv2d backward:
+
+$$Out[b,i,j,t]=\sum_{m=0}^{filter\textunderscore H-1}\sum_{n=0}^{filter\textunderscore W-1}\sum_{c=0}^{in\textunderscore channel-1}x[b,i*stride+m,j*stride+n,c]\cdot w[m,n,c,t]$$
+
+Thus we have $$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{u,v,w,y}\frac{\partial L}{\partial O[u,v,w,y]}\frac{\partial O[u,v,w,y]}{\partial x[b,i,j,t]}$$

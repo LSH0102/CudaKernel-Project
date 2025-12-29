@@ -14,6 +14,7 @@ then
 2. batched matrix multiplication (added on 2025/12/2)
 3. conv2d (added on 2025/12/13)
 4. flash attention forward (added on 2025/12/15)
+5. flash attention backward (added on 2025/12/16)
 
 ### Conv2d:implementation
 A conv2d operation with high performance can be regarded as a series of matrix multiplication. 
@@ -45,3 +46,13 @@ def conv_np(x,w,stride,padding):
     return out 
 ```
 
+### Conv2d backward:
+
+$$Out[b,i,j,t]=\sum_{m=0}^{filter\textunderscore H-1}\sum_{n=0}^{filter\textunderscore W-1}\sum_{c=0}^{in\textunderscore channel-1}x[b,i* stride+m,j* stride+n,c]\cdot w[m,n,c,t]$$
+
+Thus we have 
+$$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{u,v,w,y}dO[u,v,w,y]\frac{\partial O[u,v,w,y]}{\partial x[b,i,j,t]}$$
+
+So the above term $\neq 0$ if and only if $u=b,c=t,i=v * stride+m, j=w* stride+n$, i.e 
+
+$$\frac{\partial L}{\partial x[b,i,j,t]}=\sum_{m,n}\sum_{y}dO[b,\frac{i-m}{stride},\frac{j-n}{stride},y] * w[m,n,c,y]$$

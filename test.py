@@ -10,6 +10,7 @@ import numpy as np
 import time 
 lib=ctypes.CDLL("cuda_kernels/kernel.so")
 datatype=np.float32
+torch.device('cpu')
 
 def vector_add(a:torch.Tensor,b:torch.Tensor):
     size=a.numel()
@@ -202,6 +203,46 @@ def flash_attention_backward(q,k,v,do,mask):
     dk=dk.reshape((b,kv_len,d))
     dv=dv.reshape((b,kv_len,d))
     return dq,dk,dv
+
+def conv2d_backward(x, w, do, stride, padding):
+    b, input_H, input_W, in_channel=x.shape
+    filter_H,filter_W,in_channel,out_channel=w.shape
+
+    b,out_H,out_W,out_channel=do.shape
+
+    dx=np.zeros_like(x).flatten()
+    dw=np.zeros_like(w).flatten()
+    grid=np.zeros(shape=(b,input_H+filter_H-1,input_W+filter_W-1,out_channel)).flatten().astype(np.float32)
+    
+    stream=torch.cuda.current_stream().cuda_stream
+    lib.launch_conv2d_backward.argtypes=[
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        np.ctypeslib.ndpointer(dtype=datatype,ndim=1,flags='C_CONTIGUOUS'),
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p]
+
+    
+    lib.launch_conv2d_backward.restype=None
+    lib.launch_conv2d_backward(x.flatten(),w.flatten(),do.flatten(),dx,dw,
+                                   b,stride,input_H,input_W,filter_H,filter_W,out_H,out_W,in_channel,out_channel,stream)
+
+    dx=dx.reshape(x.shape)
+    dw=dw.reshape((filter_H,filter_W,in_channel,out_channel))
+    
+    return dx,dw
+
 
 def test_vector_add():
     shape=(2,3,4) 
@@ -406,7 +447,47 @@ def test_flash_attention_backward():
     acc=(t3-t2)/(t2-t1)
     print('acceleration:',acc)
 
+def test_conv2d_backward():
+    pad=6
+    st=2
+
+    
+    x=torch.randn(size=(1,32,32,64)).numpy()
+    w=torch.randn(size=(5,5,64,32)).numpy()
+    
+    u=torch.Tensor(x).permute(0,3,1,2)
+    v=torch.Tensor(w).permute(3,2,0,1)
+    u.requires_grad=True
+    v.requires_grad=True
+    o_ref=torch.nn.functional.conv2d(u, v,stride=st,padding=pad)
+    
+    L=o_ref.sum()
+   
+    L.backward()
+    
+    du=u.grad.data.numpy().transpose((0,2,3,1))
+    dv=v.grad.data.numpy().transpose((2,3,1,0))
+
+    do=np.ones(shape=o_ref.shape).astype(np.float32).transpose((0,2,3,1))
+   
+    x=np.pad(x,((0,0),(pad,pad),(pad,pad),(0,0)))
+    
+    dx,dw=conv2d_backward(x,w,do,stride=st,padding=pad)
+    
+    if pad>0:
+        dx=dx[:,pad:-pad,pad:-pad,:]
+    
+
+    
+    print(np.abs(dx-du).max())
+    print(np.abs(dw-dv).max())
+    
+
+    
+
+
 if __name__=="__main__":
     #test_conv2d()
     #test_flash_attention_forward()
-    test_flash_attention_backward()
+    #test_flash_attention_backward()
+    test_conv2d_backward()

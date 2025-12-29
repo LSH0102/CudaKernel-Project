@@ -24,18 +24,26 @@ __global__ void bmm_kernel(float *a,float* b,float *c,const int batch_size, cons
 	//每个block处理一对矩阵
 	int batch_id=blockIdx.x;
 
-	//每个thread处理一个 TILE_SIZE x TILE_SIZE 的小矩阵块 i.e左上角为 TILE_SIZE *i,TILE_SIZE *j 的矩阵块
+	//每个thread处理一个 tile_size x tile_size 的小矩阵块 i.e左上角为 tile_size *i,tile_size *j 的矩阵块
+	
+	int iters=(m+31)/32;
+	int iters2=(p+31)/32;
+	int tile_size=iters;
+	if (iters2>iters)
+	{
+		tile_size=iters2;
+	}
+
 	int i=threadIdx.x;
 	int j=threadIdx.y;
 	int k=0;
 	int row=0;
 	int column=0;
 	float temp=0.0;
-
 	//计算c中第row行, column列的结果
-	for(row=i*TILE_SIZE;row<m&& row<(i+1)*TILE_SIZE;row++)
+	for(row=i*tile_size;row<m&& row<(i+1)*tile_size;row++)
 	{
-		for(column=j*TILE_SIZE;column<p&&column<(j+1)*TILE_SIZE;column++)
+		for(column=j*tile_size;column<p&&column<(j+1)*tile_size;column++)
 		{
 			temp=0.0;
 			for(k=0;k<n;k++)
@@ -45,6 +53,7 @@ __global__ void bmm_kernel(float *a,float* b,float *c,const int batch_size, cons
 			c[batch_id*m*p+p*row+column]=temp;
 		}
 	}
+	
 }
 
 ///shift函数内核, 用于读取 X[:,i:i+width*stride:stride,j:j+height*stride:stride,:]
@@ -79,18 +88,26 @@ __global__ void conv_bmm(float *shift, float* filter, float *c,int batch_size,co
 	//每个block处理一对矩阵
 	int batch_id=blockIdx.x;
 
-	//每个thread处理一个 TILE_SIZE x TILE_SIZE 的小矩阵块 i.e左上角为 TILE_SIZE *i,TILE_SIZE *j 的矩阵块
+	//每个thread处理一个小矩阵块 i.e左上角为 tile_size *i,tile_size *j 的矩阵块
+
+	int iters=(m+31)/32;
+	int iters2=(p+31)/32;
+	int tile_size=iters;
+	if (iters2>iters)
+	{
+		tile_size=iters2;
+	}
+	
 	int i=threadIdx.x;
 	int j=threadIdx.y;
 	int k=0;
 	int row=0;
 	int column=0;
 	float temp=0.0;
-
 	//计算c中第row行, column列的结果
-	for(row=i*TILE_SIZE;row<m&& row<(i+1)*TILE_SIZE;row++)
+	for(row=i*tile_size;row<m&& row<(i+1)*tile_size;row++)
 	{
-		for(column=j*TILE_SIZE;column<p&&column<(j+1)*TILE_SIZE;column++)
+		for(column=j*tile_size;column<p&&column<(j+1)*tile_size;column++)
 		{
 			temp=0.0;
 			for(k=0;k<n;k++)
@@ -440,6 +457,83 @@ __global__ void flash_attention_backward(float *Q, float* O,float *dO, float* K,
 	}
 }
 
+///conv2d的backward的翻转函数
+__global__ void filp_and_transpose(float *filter, float* out, int h, int w, int in_channel, int out_channel)
+{
+	int channel_id=blockIdx.x;
+	int i,j,k;
+	int row_id=threadIdx.x;
+	int col_id=threadIdx.y;
+
+	int num1=(h+31)/32;
+	int num2=(w+31)/32;
+	if(channel_id>=in_channel)
+	{
+		return;
+	}
+	for(k=0;k<out_channel;k++)
+	{
+		//一个tread处理4个
+		for(i=0;i<num1 && row_id*num1+i<h;i++)
+		{
+			for(j=0;j<num2 && col_id*num2+j<w;j++)
+			{
+				out[(h-1-row_id*num1-i)*w*in_channel*out_channel+(w-1-j-col_id*num2)*in_channel*out_channel+k*in_channel+channel_id]=filter[(row_id*num1+i)*w*in_channel*out_channel+(col_id*num2+j)*in_channel*out_channel+channel_id*out_channel+k];
+			}
+		}
+	}
+}
+
+///conv2d用到的填充函数
+__global__ void fill_dO (float *d_o, float *res, int filter_H, int filter_W, int out_H, int out_W,int input_H, int input_W, int stride, int out_channel, int batch_size)
+{
+	int batch_id=blockIdx.x;
+	int channel_id=blockIdx.y;
+
+	int num1=(out_H+31)/32;
+	int num2=(out_W+31)/32;
+
+	int i,j;
+	int row_id=threadIdx.x;
+	int col_id=threadIdx.y;
+	int tar_x,tar_y;
+	for(i=0;i<num1 && row_id*num1+i<out_H;i++)
+	{
+		for(j=0;j<num2 && col_id*num2+j<out_W;j++)
+		{
+			tar_x=filter_H-1+(row_id*num1+i)*stride;
+			tar_y=filter_W-1+(col_id*num2+j)*stride;
+			res[batch_id*(filter_H+input_H-1)*(filter_W+input_W-1)*out_channel+tar_x*(filter_W+input_W-1)*out_channel+tar_y*out_channel+channel_id]
+					=d_o[batch_id*out_H*out_W*out_channel+(row_id*num1+i)*out_W*out_channel+(col_id*num2+j)*out_channel+channel_id];
+			
+		}
+	}
+}
+
+///conv2d计算dw的函数
+__global__ void compute_dw(float *x,float *dO, float *dw,int batch_size, int stride,
+							int input_H, int input_W,int filter_H,int filter_W,int out_H,int out_W,int in_channel,int out_channel, int p,int q)
+{
+	int in_channel_id=blockIdx.x*32+threadIdx.x;
+	int out_channel_id=blockIdx.y*32+threadIdx.y;
+	if(in_channel_id>=in_channel || out_channel_id>=out_channel)
+	{
+		return;
+	}
+	int i,j,k;
+	for(k=0;k<batch_size;k++)
+	{
+		for(i=0;i<out_H;i++)
+		{
+			for(j=0;j<out_W;j++)
+			{
+				dw[p*filter_W*in_channel*out_channel+q*in_channel*out_channel+in_channel_id*out_channel+out_channel_id]+=
+						dO[k*out_H*out_W*out_channel+i*out_W*out_channel+j*out_channel+out_channel_id]*x[k*input_H*input_W*in_channel+(p+i*stride)*input_W*in_channel+(q+j*stride)*in_channel+in_channel_id];
+			}
+		}
+	}
+}
+
 ///调用内核的主程序
 extern "C"
 {
@@ -487,12 +581,10 @@ extern "C"
 		cudaMemcpy(d_b,b,b_size,cudaMemcpyHostToDevice);
 		cudaMemcpy(d_c,c,c_size,cudaMemcpyHostToDevice);
 
-		//支持的最大长与宽为32*TILE_SIZE
-		int nthreadx=(m+TILE_SIZE-1)/TILE_SIZE;
-		int nthready=(p+TILE_SIZE-1)/TILE_SIZE;
+		
 		
 		dim3 grid_dim(batch_size);
-		dim3 block_dim(nthreadx,nthready);
+		dim3 block_dim(32,32,1);
 
 		bmm_kernel<<<grid_dim,block_dim,0,stream>>>(d_a,d_b,d_c, batch_size,m,n,p);
 
@@ -556,9 +648,8 @@ extern "C"
 		dim3 grid_dim(batch_size);
 		dim3 block_dim(32,32,1);
 
-		int nthreadx=(out_H*out_W+TILE_SIZE-1)/TILE_SIZE;
-		int nthready=(out_channel+TILE_SIZE-1)/TILE_SIZE;
-		dim3 block_dim2(nthreadx,nthready);
+		
+		dim3 block_dim2(32,32,1);
 
 
 		int i,j;
@@ -581,6 +672,41 @@ extern "C"
 		cudaFree(d_out);
 		cudaFree(temp);
 		cudaFree(shift);
+	}
+
+	void device_conv2d(float *input, float *filter, float * out,const int batch_size, const int stride, const int input_H, const int input_W, 
+						const int filter_H, const int filter_W, 
+						const int out_H,const int out_W,
+						const int in_channel, const int out_channel,cudaStream_t stream)
+	{
+		
+		int shift_size=sizeof(float)*batch_size*in_channel*input_H*input_W;
+		float *shift;
+		cudaMalloc((void**)&shift,shift_size);
+
+		dim3 grid_dim(batch_size);
+		dim3 block_dim(32,32,1);
+
+
+		
+		dim3 block_dim2(32,32,1);
+
+
+		int i,j;
+		for(i=0;i<filter_H;i++)
+		{
+			for(j=0;j<filter_W;j++)
+			{
+				//读取input的一部分
+				shift_kernel<<<grid_dim,block_dim,0,stream>>>(input,shift,i,j,stride,input_H,input_W,out_H,out_W,in_channel);
+				//和filter的[i,j]个元素做bmm, 并加给d_out
+				conv_bmm<<<grid_dim,block_dim2,0,stream>>>(shift,filter+i*filter_W*in_channel*out_channel+j*in_channel*out_channel,out,batch_size,out_H*out_W,in_channel,out_channel);
+			}
+
+		}
+		cudaFree(shift);
+
+
 	}
 	
 	void launch_flash_attention_forward(float *Q, float *K, float *V,float *m, float *O,  int batch_size, int q_len, int kv_len, int d, float scale, cudaStream_t stream)
@@ -685,8 +811,77 @@ extern "C"
 		cudaFree(d_pK);
 		cudaFree(d_pV);
 		cudaFree(d_m);
-
-
-
 	}
+
+	void launch_conv2d_backward(float *input, float *filter, float *out_grad, float *dx, float *dw,const int batch_size, const int stride, 
+						const int input_H, const int input_W, const int filter_H,const int filter_W, 
+						const int out_H, const int out_W,const int in_channel, const int out_channel,cudaStream_t stream)
+	{
+		int input_size=sizeof(float)*input_H*input_W*in_channel*batch_size;
+		int filter_size=sizeof(float)*filter_H*filter_W*out_channel*in_channel;
+		int out_size=sizeof(float)*out_H*out_W*out_channel*batch_size;
+
+		int dO_size=sizeof(float)*out_channel*(input_H+filter_H-1)*(input_W+filter_W-1)*batch_size;
+		
+		float *tilde_w,*d_filter, *dO, *d_x,*d_o, *d_input;
+		cudaMalloc((void**)&tilde_w,filter_size);
+		cudaMalloc((void**)&d_filter,filter_size);
+		cudaMalloc((void**)&dO,dO_size);
+		cudaMalloc((void**)&d_x,input_size);
+		cudaMalloc((void**)&d_o,out_size);
+		cudaMalloc((void**)&d_input,input_size);
+
+
+
+		cudaMemcpy(d_filter,filter,filter_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_o,out_grad,out_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(tilde_w,filter,filter_size,cudaMemcpyHostToDevice);
+		cudaMemcpy(d_input,input,input_size,cudaMemcpyHostToDevice);
+
+		//对w进行前两个维数的翻转和后两个维数的转置
+		dim3 grid_dim1(in_channel);
+		dim3 block_dim1(32,32,1);
+		filp_and_transpose<<<grid_dim1,block_dim1,0,stream>>>(d_filter,  tilde_w,  filter_H,  filter_W, in_channel,out_channel);
+		cudaDeviceSynchronize();
+
+		//填充dO
+		dim3 grid_dim2(batch_size,out_channel,1);
+		dim3 block_dim2(32,32,1);
+		fill_dO<<<grid_dim2,block_dim2,0,stream>>>(d_o, dO, filter_H, filter_W, out_H, out_W,input_H, input_W,stride, out_channel, batch_size );
+		cudaDeviceSynchronize();
+
+
+		device_conv2d(dO, tilde_w, d_x, batch_size, 1, input_H+filter_H-1, input_W+filter_W-1, 
+						filter_H, filter_W, 
+						input_H,input_W,
+						out_channel, in_channel,stream);
+		
+
+		cudaDeviceSynchronize();
+		cudaMemcpy(dx,d_x,input_size,cudaMemcpyDeviceToHost);
+		
+		//然后计算dw
+		cudaMemcpy(d_filter,dw,filter_size,cudaMemcpyHostToDevice);
+
+		dim3 grid_dim3((in_channel+31)/32,(out_channel+31)/32,1);
+		dim3 block_dim3(32,32,1);
+		int p,q;
+		for(p=0;p<filter_H;p++)
+		{
+			for(q=0;q<filter_W;q++)
+			{
+				compute_dw<<<grid_dim3,block_dim3,0,stream>>>(d_input,d_o, d_filter,batch_size,stride,input_H, input_W, filter_H, filter_W, out_H, out_W, in_channel, out_channel,p,q);
+			}
+		}
+
+		cudaMemcpy(dw,d_filter,filter_size,cudaMemcpyDeviceToHost);
+		
+		cudaFree(tilde_w);
+		cudaFree(d_filter);
+		cudaFree(dO);
+		cudaFree(d_x);
+		cudaFree(d_o);
+		cudaFree(d_input);
+	}
+
 }

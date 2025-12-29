@@ -15,6 +15,7 @@ then
 3. conv2d (added on 2025/12/13)
 4. flash attention forward (added on 2025/12/15)
 5. flash attention backward (added on 2025/12/16)
+6. conv2d backward (added on 2025/12/29)
 
 ### Conv2d:implementation
 A conv2d operation with high performance can be regarded as a series of matrix multiplication. 
